@@ -52,6 +52,9 @@
 
 #define STR_MAGIC (0x80010160)
 
+#define MDEC_STR_FPS_MIN 15
+#define MDEC_STR_FPS_MAX 30
+
 typedef struct StrChannel {
     /* video parameters */
     int video_stream_index;
@@ -65,6 +68,10 @@ typedef struct StrDemuxContext {
 
     /* a STR file can contain up to 32 channels of data */
     StrChannel channels[32];
+    /* trivial FPS detection based on sectors per frame */
+    int fps_min; /* slowest FPS found */
+    int fps_max; /* fastest FPS found */
+    int fps_val; /* nominal FPS value */
 } StrDemuxContext;
 
 static const uint8_t sync_header[12] = {0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x00};
@@ -150,6 +157,10 @@ static int str_read_header(AVFormatContext *s)
         str->channels[i].audio_stream_index= -1;
     }
 
+    str->fps_min = INT_MAX;
+    str->fps_max = INT_MIN;
+    str->fps_val = 0;
+
     s->ctx_flags |= AVFMTCTX_NOHEADER;
 
     return 0;
@@ -161,7 +172,7 @@ static int str_read_packet(AVFormatContext *s,
     AVIOContext *pb = s->pb;
     StrDemuxContext *str = s->priv_data;
     unsigned char sector[RAW_CD_SECTOR_SIZE];
-    int channel, ret;
+    int channel, ret, sub_mode, idx_sect, num_sect;
     AVPacket *pkt;
     AVStream *st;
 
@@ -177,6 +188,18 @@ static int str_read_packet(AVFormatContext *s,
         channel = sector[0x11];
         if (channel >= 32)
             return AVERROR_INVALIDDATA;
+
+        sub_mode = sector[0x12];
+        idx_sect = AV_RL16(&sector[0x1C]);
+        num_sect = AV_RL16(&sector[0x1E]);
+
+        /* compute FPS from sector count @ each new video frame */
+        if (sub_mode & 0x02 && idx_sect == 0x00) {
+            int fps = 150 / num_sect;
+            str->fps_min = FFMIN(str->fps_min, fps);
+            str->fps_max = FFMAX(str->fps_max, fps);
+            str->fps_val = FFMIN(MDEC_STR_FPS_MAX, FFMAX(MDEC_STR_FPS_MIN, str->fps_min));
+        }
 
         switch (sector[0x12] & CDXA_TYPE_MASK) {
 
@@ -200,7 +223,7 @@ static int str_read_packet(AVFormatContext *s,
                     st = avformat_new_stream(s, NULL);
                     if (!st)
                         return AVERROR(ENOMEM);
-                    avpriv_set_pts_info(st, 64, 1, 15);
+                    avpriv_set_pts_info(st, 64, 1, str->fps_val);
 
                     str->channels[channel].video_stream_index = st->index;
 
